@@ -1,4 +1,4 @@
-<img src="guysinc-public-banner.svg" alt="Guys Inc" width="100%">
+<img src="guysinc-public-banner.svg" alt="Guys Inc Public" width="100%">
 
 Small, well-made software from Guys Inc. Most of it is given away here.
 
@@ -6,7 +6,7 @@ Small, well-made software from Guys Inc. Most of it is given away here.
 
 - Public products: the things Guys Inc releases, for anyone who wants to run them.
 - `website`, the one private repository here: the Guys Inc site at guysinc.pub.
-- Not here: the platform behind them (GICloud), the family's software (The House), forks of other people's work (Guys Inc Forks).
+- Not here: the platform behind them (Guys Inc Cloud), the family's software (The House), forks of other people's work (Guys Inc Forks).
 
 ## Start here
 
@@ -23,7 +23,7 @@ A repository is created, moved or archived by a pull request to [guysinc-cloud/e
 
 | Organisation | Holds |
 |---|---|
-| [GICloud](https://github.com/guysinc-cloud) | The platform |
+| [Guys Inc Cloud](https://github.com/guysinc-cloud) | The platform |
 | [The House](https://github.com/guysinc-home) | Family production |
 | [Guys Inc Labs](https://github.com/guysinc-labs) | What has no production yet |
 | [Guys Inc Forks](https://github.com/guysinc-forks) | Forks, kept as upstream has them |
