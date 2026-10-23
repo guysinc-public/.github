@@ -1,0 +1,40 @@
+# The one check every repository exposes (Branding-Standards ADRs 0020, 0021): the organisation
+# ruleset requires a check named "check". This repository is the organisation profile, so the check
+# is: every SVG parses as XML, and every local image or link the Markdown names exists.
+# No `paths:` filter: a required check that never starts blocks the merge.
+name: check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: SVGs parse, local references exist
+        shell: python
+        run: |
+          import pathlib, re, sys, xml.etree.ElementTree as ET
+          bad = []
+          for svg in pathlib.Path(".").rglob("*.svg"):
+              try:
+                  ET.parse(svg)
+              except ET.ParseError as e:
+                  bad.append(f"{svg}: {e}")
+          for md in pathlib.Path(".").rglob("*.md"):
+              for ref in re.findall(r"\]\(([^)\s]+)\)|src=\"([^\"]+)\"", md.read_text()):
+                  target = next(r for r in ref if r)
+                  if re.match(r"^(https?:|mailto:|#)", target):
+                      continue
+                  if not (md.parent / target.split("#")[0]).exists():
+                      bad.append(f"{md}: {target} does not exist")
+          print("\n".join(bad) or "ok")
+          sys.exit(1 if bad else 0)
