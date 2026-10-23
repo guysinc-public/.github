@@ -31,7 +31,8 @@ jobs:
               except ET.ParseError as e:
                   bad.append(f"{svg.relative_to(root)}: {e}")
           for md in root.rglob("*.md"):
-              links = r"\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)|src=\"([^\"]+)\""
+              # [text](target), [text](<tar get>), either with a "title", 'title' or (title); src="…" or src='…'.
+              links = r"\]\(\s*(?:<([^>]+)>|([^)\s]+))(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)|src=(?:\"([^\"]+)\"|'([^']+)')"
               for ref in re.findall(links, md.read_text()):
                   target = next(r for r in ref if r)
                   # Any scheme (https:, mailto:, data:, tel:), a protocol-relative //host or an anchor is not a file.
