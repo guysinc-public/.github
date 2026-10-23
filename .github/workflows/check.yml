@@ -22,19 +22,25 @@ jobs:
       - name: SVGs parse, local references exist
         shell: python
         run: |
-          import pathlib, re, sys, xml.etree.ElementTree as ET
+          import pathlib, re, sys, urllib.parse, xml.etree.ElementTree as ET
+          root = pathlib.Path(".").resolve()
           bad = []
-          for svg in pathlib.Path(".").rglob("*.svg"):
+          for svg in root.rglob("*.svg"):
               try:
                   ET.parse(svg)
               except ET.ParseError as e:
-                  bad.append(f"{svg}: {e}")
-          for md in pathlib.Path(".").rglob("*.md"):
-              for ref in re.findall(r"\]\(([^)\s]+)\)|src=\"([^\"]+)\"", md.read_text()):
+                  bad.append(f"{svg.relative_to(root)}: {e}")
+          for md in root.rglob("*.md"):
+              links = r"\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)|src=\"([^\"]+)\""
+              for ref in re.findall(links, md.read_text()):
                   target = next(r for r in ref if r)
-                  if re.match(r"^(https?:|mailto:|#)", target):
+                  # Any scheme (https:, mailto:, data:, tel:), a protocol-relative //host or an anchor is not a file.
+                  if re.match(r"^([A-Za-z][A-Za-z0-9+.-]*:|//|#)", target):
                       continue
-                  if not (md.parent / target.split("#")[0]).exists():
-                      bad.append(f"{md}: {target} does not exist")
+                  path = urllib.parse.unquote(re.split(r"[?#]", target)[0])
+                  # GitHub resolves a root-relative reference against the repository, never the runner's disk.
+                  file = (root / path.lstrip("/") if path.startswith("/") else md.parent / path).resolve()
+                  if not file.is_relative_to(root) or not file.exists():
+                      bad.append(f"{md.relative_to(root)}: {target} does not exist in the repository")
           print("\n".join(bad) or "ok")
           sys.exit(1 if bad else 0)
