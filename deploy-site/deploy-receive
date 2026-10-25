@@ -1,0 +1,129 @@
+#!/bin/bash
+# deploy-receive: the host half of the deploy-site workflow (.github/workflows/deploy-site.yml).
+# It runs as the forced command of one deploy key in ~/.ssh/authorized_keys:
+#
+#   command="/home/<user>/bin/deploy-receive --domain example.com",restrict ssh-ed25519 AAAA… <repo>
+#
+# The options come from that line and never from the caller, so a key can only do what its line
+# says (docs/reference/deploy-site.md):
+#   --domain <fqdn>       the one site this key deploys. Required.
+#   --allow-htaccess      ship .ht* files. An .htaccess can switch on PHP, so only for sites we write.
+#   --allow-server-code   ship PHP, CGI, SSI and anything else the web server would run.
+#
+# The caller asks for `deploy <fqdn>` with a gzipped tar of the web root on stdin, `rollback <fqdn>`
+# to swap the previous version back in, or `list`.
+set -euo pipefail
+
+DOMAINS_DIR="$HOME/domains"
+die(){ echo "deploy-receive: $*" >&2; exit 1; }
+refuse(){
+  echo "deploy-receive: refused, $1:" >&2
+  printf '%s\n' "$2" | head -20 | sed 's/^/  /' >&2
+  exit 1
+}
+
+domain="" allow_htaccess=0 allow_code=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain)            [[ $# -ge 2 ]] || die "--domain needs a value in authorized_keys"
+                         domain="$2"; shift 2 ;;
+    --allow-htaccess)    allow_htaccess=1; shift ;;
+    --allow-server-code) allow_code=1; shift ;;
+    *) die "unknown option in authorized_keys: $1" ;;
+  esac
+done
+# A key line without --domain could deploy any site on the account; that is the bug this replaces.
+[[ -n "$domain" ]] || die "this key's authorized_keys line names no --domain"
+[[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$domain" != *..* ]] || die "bad --domain: $domain"
+
+read -r -a cmd <<< "${SSH_ORIGINAL_COMMAND:-}"
+action="${cmd[0]:-}" fqdn="${cmd[1]:-}"
+case "$action" in
+  list) echo "$domain"; exit 0 ;;
+  deploy|rollback) [[ ${#cmd[@]} -eq 2 ]] || die "usage: $action <fqdn>" ;;
+  *) die "only 'deploy <fqdn>', 'rollback <fqdn>' or 'list' (got '${SSH_ORIGINAL_COMMAND:-}')" ;;
+esac
+[[ "$fqdn" == "$domain" ]] || die "this key deploys $domain, not '$fqdn'"
+
+SITE="$DOMAINS_DIR/$domain"
+[[ -d "$SITE" ]] || die "domain not provisioned in DirectAdmin: $domain"
+DOC="$SITE/public_html"
+PREV="$SITE/public_html.prev"
+
+# One deploy per site at a time, whichever repository or key sent it.
+exec 9>"$SITE/.deploy.lock"
+flock -w 120 9 || die "another deploy of $domain has held the lock for two minutes"
+
+if [[ "$action" == rollback ]]; then
+  [[ -d "$PREV" && -d "$DOC" ]] || die "no previous version of $domain to roll back to"
+  SWAP="$SITE/.deploy.swap.$$"
+  # A dropped connection must not stop the renames halfway and leave no public_html.
+  trap '' HUP INT TERM PIPE
+  mv "$DOC" "$SWAP"
+  mv "$PREV" "$DOC" || { mv "$SWAP" "$DOC"; die "rollback failed; the live version is unchanged"; }
+  mv "$SWAP" "$PREV" || die "rolled back, but the replaced version is left at ${SWAP##*/}, not public_html.prev"
+  echo "rolled back $domain: the previous version is live, and the one it replaced is public_html.prev"
+  exit 0
+fi
+
+NEW="$SITE/.deploy.new.$$"
+cleanup(){ rm -rf "$NEW"; }
+trap cleanup EXIT
+
+# --- receive and stage, outside the docroot so nothing is served until it passes ------------------
+rm -rf "$NEW"; mkdir -m 755 "$NEW"
+# GNU tar strips leading '/', refuses '..' members and defers symlinks, and we run unprivileged, so
+# extraction stays inside $NEW. (The cage's tar wrapper rejects --no-absolute-names/--no-same-owner,
+# which would only restate those defaults anyway.)
+tar xzf - -C "$NEW"
+cd "$NEW"
+
+[[ -n "$(find . -type f -print -quit)" ]] || refuse "the archive holds no files" "(an empty deploy would blank the site)"
+
+# No process substitution in this file: the cage gives a forced command no /dev/fd.
+found=$(find . \( -type l -o \( ! -type f ! -type d \) -o \( -type f -links +1 \) \) -print)
+# A symlink would let the web server read anything the account can, other sites and ~/.ssh included.
+[[ -z "$found" ]] || refuse "links and special files are never deployed" "$found"
+
+if (( ! allow_htaccess )); then
+  found=$(find . -name '.ht*' -print)
+  [[ -z "$found" ]] || refuse "this key may not ship .htaccess files" "$found"
+fi
+
+if (( ! allow_code )); then
+  # Every site on the account runs as the account's user, so one script on any site can read and
+  # rewrite all of them. Each extension is matched as any dot-separated part of the name, last or
+  # not, since Apache's AddHandler runs x.php.jpg; matching whole parts keeps jquery.plugin.js out.
+  # Plain .sh/.py files stay allowed: nothing runs them outside cgi-bin without an .htaccess.
+  code_ext=(php 'php[0-9]' phps phtml pht phar cgi fcgi pl shtml shtm stm asp aspx jsp)
+  match=(-path ./cgi-bin -o -name .user.ini -o -name php.ini)
+  for ext in "${code_ext[@]}"; do match+=(-o -iname "*.$ext" -o -iname "*.$ext.*"); done
+  found=$(find . \( "${match[@]}" \) -print)
+  [[ -z "$found" ]] || refuse "this key may not ship server-side code" "$found"
+fi
+
+# Readable by the web server, writable by nobody else, whatever modes the archive carried.
+chmod -R u+rwX,go+rX,go-w .
+
+# Preserve the DA-created cgi-bin unless the site ships its own.
+if [[ -d "$DOC/cgi-bin" && ! -e "$NEW/cgi-bin" ]]; then
+  cp -a "$DOC/cgi-bin" "$NEW/cgi-bin"
+fi
+
+# --- swap, keeping one version back --------------------------------------------------------------
+# The oldest version is only deleted once the new one is in place; a failed rename puts back what was
+# live, and a dropped connection cannot stop the renames halfway.
+cd "$SITE"
+OLD="$SITE/.deploy.old.$$"
+trap '' HUP INT TERM PIPE
+if [[ -e "$PREV" ]]; then mv "$PREV" "$OLD"; fi
+if [[ -e "$DOC" ]]; then mv "$DOC" "$PREV"; fi
+if ! mv "$NEW" "$DOC"; then
+  if [[ -e "$PREV" ]]; then mv "$PREV" "$DOC"; fi
+  if [[ -e "$OLD" ]]; then mv "$OLD" "$PREV"; fi
+  die "the swap failed; the version that was live still is"
+fi
+trap - EXIT
+rm -rf "$OLD"
+
+echo "deployed $domain: $(find "$DOC" -type f | wc -l) files live; the previous version is public_html.prev"
