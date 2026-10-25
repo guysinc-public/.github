@@ -1,0 +1,102 @@
+# The shared deploy for a static website (Branding-Standards ADR 0023). The caller names its domain
+# and its 1Password item; this ships the web root over SSH to the host's forced-command receiver,
+# deploy-site/deploy-receive, which swaps it in and keeps the previous version for rollback.
+# Inputs, item fields and every refusal: docs/reference/deploy-site.md.
+name: deploy-site
+on:
+  workflow_call:
+    inputs:
+      domain:
+        description: The hostname to deploy. The item's key is locked to it on the host.
+        required: true
+        type: string
+      item:
+        description: The 1Password item holding the key and the host, as op://<vault>/<item>.
+        required: true
+        type: string
+      path:
+        description: The folder in the repository that is the web root. Unused when artifact is set.
+        type: string
+        default: site
+      artifact:
+        description: An artifact uploaded earlier in the same run that holds the built web root.
+        type: string
+        default: ""
+      rollback:
+        description: Put the previous version back instead of deploying.
+        type: boolean
+        default: false
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: The organisation's read-only 1Password service account.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy ${{ inputs.domain }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://${{ inputs.domain }}
+    # Two pushes in a row: the second waits for the first, never cancels it halfway through a swap.
+    concurrency:
+      group: deploy-site-${{ inputs.domain }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the web root
+        if: ${{ !inputs.rollback && inputs.artifact == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+
+      - name: Download the built web root
+        if: ${{ !inputs.rollback && inputs.artifact != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/web-root
+
+      # Every value is masked in the log, the host and user too: a public repository's log is public,
+      # and the origin of a site behind Cloudflare stays unnamed.
+      - name: Read the deploy item
+        id: op
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2 # v5.0.1
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          DEPLOY_KEY: ${{ inputs.item }}/private key?ssh-format=openssh
+          DEPLOY_HOST: ${{ inputs.item }}/hostname
+          DEPLOY_PORT: ${{ inputs.item }}/port
+          DEPLOY_USER: ${{ inputs.item }}/username
+          DEPLOY_KNOWN_HOSTS: ${{ inputs.item }}/known_hosts
+
+      - name: Ship it
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          ROLLBACK: ${{ inputs.rollback }}
+          WEB_ROOT: ${{ inputs.artifact != '' && format('{0}/web-root', runner.temp) || format('{0}/{1}', github.workspace, inputs.path) }}
+          DEPLOY_KEY: ${{ steps.op.outputs.DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ steps.op.outputs.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ steps.op.outputs.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ steps.op.outputs.DEPLOY_USER }}
+          DEPLOY_KNOWN_HOSTS: ${{ steps.op.outputs.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "::error::not a hostname: $DOMAIN"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # The host key is pinned in the item; a changed key fails here rather than trusting on first use.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          remote=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" -o IdentitiesOnly=yes -o BatchMode=yes
+                  -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST")
+
+          if [[ "$ROLLBACK" == true ]]; then
+            "${remote[@]}" "rollback $DOMAIN"
+            exit 0
+          fi
+          [[ -d "$WEB_ROOT" ]] || { echo "::error::no web root at $WEB_ROOT"; exit 1; }
+          echo "Shipping $(find "$WEB_ROOT" -type f -not -path '*/.git/*' | wc -l) files to $DOMAIN"
+          tar czf - --exclude-vcs -C "$WEB_ROOT" . | "${remote[@]}" "deploy $DOMAIN"
