@@ -57,7 +57,11 @@ flock -w 120 9 || die "another deploy of $domain has held the lock for two minut
 if [[ "$action" == rollback ]]; then
   [[ -d "$PREV" && -d "$DOC" ]] || die "no previous version of $domain to roll back to"
   SWAP="$SITE/.deploy.swap.$$"
-  mv "$DOC" "$SWAP"; mv "$PREV" "$DOC"; mv "$SWAP" "$PREV"
+  # A dropped connection must not stop the renames halfway and leave no public_html.
+  trap '' HUP INT TERM PIPE
+  mv "$DOC" "$SWAP"
+  mv "$PREV" "$DOC" || { mv "$SWAP" "$DOC"; die "rollback failed; the live version is unchanged"; }
+  mv "$SWAP" "$PREV" || die "rolled back, but the replaced version is left at ${SWAP##*/}, not public_html.prev"
   echo "rolled back $domain: the previous version is live, and the one it replaced is public_html.prev"
   exit 0
 fi
@@ -88,11 +92,13 @@ fi
 
 if (( ! allow_code )); then
   # Every site on the account runs as the account's user, so one script on any site can read and
-  # rewrite all of them. Match the extension anywhere in the name: Apache's AddHandler runs x.php.jpg.
+  # rewrite all of them. Each extension is matched as any dot-separated part of the name, last or
+  # not, since Apache's AddHandler runs x.php.jpg; matching whole parts keeps jquery.plugin.js out.
   # Plain .sh/.py files stay allowed: nothing runs them outside cgi-bin without an .htaccess.
-  found=$(find . \( -path ./cgi-bin -o -name .user.ini -o -name php.ini \
-      -o -iname '*.php*' -o -iname '*.pht*' -o -iname '*.phar*' -o -iname '*.cgi*' -o -iname '*.fcgi*' \
-      -o -iname '*.pl' -o -iname '*.shtm*' -o -iname '*.stm' -o -iname '*.asp*' -o -iname '*.jsp*' \) -print)
+  code_ext=(php 'php[0-9]' phps phtml pht phar cgi fcgi pl shtml shtm stm asp aspx jsp)
+  match=(-path ./cgi-bin -o -name .user.ini -o -name php.ini)
+  for ext in "${code_ext[@]}"; do match+=(-o -iname "*.$ext" -o -iname "*.$ext.*"); done
+  found=$(find . \( "${match[@]}" \) -print)
   [[ -z "$found" ]] || refuse "this key may not ship server-side code" "$found"
 fi
 
@@ -105,10 +111,19 @@ if [[ -d "$DOC/cgi-bin" && ! -e "$NEW/cgi-bin" ]]; then
 fi
 
 # --- swap, keeping one version back --------------------------------------------------------------
+# The oldest version is only deleted once the new one is in place; a failed rename puts back what was
+# live, and a dropped connection cannot stop the renames halfway.
 cd "$SITE"
-rm -rf "$PREV"
-[[ -e "$DOC" ]] && mv "$DOC" "$PREV"
-mv "$NEW" "$DOC"
+OLD="$SITE/.deploy.old.$$"
+trap '' HUP INT TERM PIPE
+if [[ -e "$PREV" ]]; then mv "$PREV" "$OLD"; fi
+if [[ -e "$DOC" ]]; then mv "$DOC" "$PREV"; fi
+if ! mv "$NEW" "$DOC"; then
+  if [[ -e "$PREV" ]]; then mv "$PREV" "$DOC"; fi
+  if [[ -e "$OLD" ]]; then mv "$OLD" "$PREV"; fi
+  die "the swap failed; the version that was live still is"
+fi
 trap - EXIT
+rm -rf "$OLD"
 
 echo "deployed $domain: $(find "$DOC" -type f | wc -l) files live; the previous version is public_html.prev"

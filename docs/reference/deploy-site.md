@@ -65,7 +65,7 @@ command="/home/<user>/bin/deploy-receive --domain example.com",restrict ssh-ed25
 | `--allow-htaccess` | The site may ship `.ht*` files. An `.htaccess` can switch on PHP, so only for repositories nobody outside Guys Inc writes. |
 | `--allow-server-code` | The site may ship PHP, CGI, SSI, `.user.ini` and a `cgi-bin/`. Every site on the account runs as one Unix user, so this is access to all of them. |
 
-Always refused: symlinks, hard links, device files and an archive with no files. The swap keeps one version back at `public_html.prev`; a DirectAdmin `cgi-bin/` is carried over unless the site ships its own. Files are made world-readable and writable only by the account.
+Always refused: symlinks, hard links, device files and an archive with no files. The swap keeps one version back at `public_html.prev`, puts back what was live if a rename fails, and ignores a dropped connection until it is done; a DirectAdmin `cgi-bin/` is carried over unless the site ships its own. Files are made world-readable and writable only by the account.
 
 ## Returns
 
@@ -80,7 +80,7 @@ deployed guysinc.pub: 13 files live; the previous version is public_html.prev
 |---|---|
 | `this key deploys A, not 'B'` | `domain` does not match the key's `--domain`. |
 | `refused, this key may not ship .htaccess files` | The web root holds a `.ht*` file and the key has no `--allow-htaccess`. |
-| `refused, this key may not ship server-side code` | A `*.php*`, `*.phtml`, `*.cgi`, `*.pl`, `*.shtml`, `*.asp*`, `*.jsp*`, `.user.ini`, `php.ini` or `cgi-bin/`. The name is listed. |
+| `refused, this key may not ship server-side code` | A name with a PHP, CGI, Perl, SSI, ASP or JSP extension as any dot-separated part (`x.php`, `x.php.jpg`, `x.PHTML`), a `.user.ini`, a `php.ini` or a `cgi-bin/`. The name is listed. |
 | `refused, links and special files are never deployed` | A symlink or hard link in the web root. |
 | `refused, the archive holds no files` | `path` or the artifact is empty. |
 | `domain not provisioned in DirectAdmin` | `~/domains/<fqdn>` does not exist on the host. |
