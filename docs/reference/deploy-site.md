@@ -1,13 +1,13 @@
 ---
 type: reference
 owner: CJ
-reviewed: 2026-10-25
+reviewed: 2026-10-28
 review: every release of deploy-site
 ---
 
 # deploy-site
 
-The shared deploy for a static website: [`.github/workflows/deploy-site.yml`](../../.github/workflows/deploy-site.yml) on the runner, [`deploy-site/deploy-receive`](../../deploy-site/deploy-receive) on the host. How the pieces fit, adding a site, and what to do when a deploy fails are on Meridian, GICloud › *Websites on NameCrane deploy through one locked receiver*.
+The shared deploy for a website on NameCrane, a static web root or a CloudLinux Node.js app: [`.github/workflows/deploy-site.yml`](../../.github/workflows/deploy-site.yml) on the runner, [`deploy-site/deploy-receive`](../../deploy-site/deploy-receive) on the host. How the pieces fit, adding a site, and what to do when a deploy fails are on Meridian, GICloud › *Websites on NameCrane deploy through one locked receiver*.
 
 ## Signature
 
@@ -64,6 +64,7 @@ command="/home/<user>/bin/deploy-receive --domain example.com",restrict ssh-ed25
 | `--domain <fqdn>` | Required. The only site the key can deploy, roll back or list. `~/domains/<fqdn>` must already exist (DirectAdmin creates it). |
 | `--allow-htaccess` | The site may ship `.ht*` files. An `.htaccess` can switch on PHP, so only for repositories nobody outside Guys Inc writes. |
 | `--allow-server-code` | The site may ship PHP, CGI, SSI, `.user.ini` and a `cgi-bin/`. Every site on the account runs as one Unix user, so this is access to all of them. |
+| `--node-app <name>` | The archive is a Node.js app, not a web root: it replaces `~/apps/<name>`, the app root `cloudlinux-selector create` was given, whose Passenger lines stay in the domain's `public_html/.htaccess`. The startup file that `.htaccess` names and a `package.json` must be in the archive; node_modules ships built, with no `.bin` links. Passenger restarts the app (`tmp/restart.txt`), and `https://<fqdn>/healthz` must answer 200 within 90 seconds, or the previous version goes back by itself and the failed one is deleted. Server code is the point of such a key, so the two `--allow` options don't apply, and it is the same access to the whole account. |
 
 Always refused: symlinks, hard links, device files and an archive with no files. The swap keeps one version back at `public_html.prev`, puts back what was live if a rename fails, and ignores a dropped connection until it is done; a DirectAdmin `cgi-bin/` is carried over unless the site ships its own. Files are made world-readable and writable only by the account.
 
@@ -71,8 +72,10 @@ Always refused: symlinks, hard links, device files and an archive with no files.
 
 ```text
 Shipping 13 files to guysinc.pub
-deployed guysinc.pub: 13 files live; the previous version is public_html.prev
+deployed guysinc.pub: 13 files live in public_html; the previous version is public_html.prev
 ```
+
+A `--node-app` key keeps its previous version at `~/apps/<name>.prev` instead, and `rollback` restarts the app and checks `/healthz` too.
 
 ## Errors
 
@@ -88,7 +91,12 @@ deployed guysinc.pub: 13 files live; the previous version is public_html.prev
 | `Permission denied (publickey)` | The key's line is missing from `authorized_keys`. DirectAdmin's SSH Keys page can rewrite the file. |
 | `Host key verification failed` | The host's key changed; compare it before updating `known_hosts`. |
 | `no web root at …` | `path` does not exist in the checkout. |
+| `no Node.js app at ~/apps/<name>` | The key has `--node-app` but `cloudlinux-selector create` was never run for that app root. |
+| `… public_html/.htaccess does not run ~/apps/<name>` | The domain's Passenger lines point at another app root. |
+| `refused, the app's startup file is missing` | The archive has no file at the `PassengerStartupFile` path. |
+| `https://<fqdn>/healthz answered N, not 200` | The new version did not come up; the next line says whether the previous one is back. Read `~/apps/<name>/stderr.log` on the host. |
 
 ## Changed in
 
+- v1.1.0: the receiver's `--node-app` mode for CloudLinux Node.js apps (first, Meade-Hub/meade-detailing). The workflow is unchanged; a caller on v1.0.0 keeps working.
 - v1.0.0: first release. Replaces guysinc-web's own deploy, whose key could deploy any domain on the account.

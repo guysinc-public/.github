@@ -9,6 +9,11 @@
 #   --domain <fqdn>       the one site this key deploys. Required.
 #   --allow-htaccess      ship .ht* files. An .htaccess can switch on PHP, so only for sites we write.
 #   --allow-server-code   ship PHP, CGI, SSI and anything else the web server would run.
+#   --node-app <name>     deploy a CloudLinux Node.js app instead of a web root: the archive replaces
+#                         ~/apps/<name> (the app root cloudlinux-selector was created with, its .htaccess
+#                         staying in public_html), Passenger restarts it, and https://<fqdn>/healthz must
+#                         answer 200 within 90 seconds or the previous version goes back by itself.
+#                         Server code is the point of such a key, so the two --allow options don't apply.
 #
 # The caller asks for `deploy <fqdn>` with a gzipped tar of the web root on stdin, `rollback <fqdn>`
 # to swap the previous version back in, or `list`.
@@ -22,19 +27,22 @@ refuse(){
   exit 1
 }
 
-domain="" allow_htaccess=0 allow_code=0
+domain="" allow_htaccess=0 allow_code=0 node_app=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)            [[ $# -ge 2 ]] || die "--domain needs a value in authorized_keys"
                          domain="$2"; shift 2 ;;
     --allow-htaccess)    allow_htaccess=1; shift ;;
     --allow-server-code) allow_code=1; shift ;;
+    --node-app)          [[ $# -ge 2 ]] || die "--node-app needs a value in authorized_keys"
+                         node_app="$2"; shift 2 ;;
     *) die "unknown option in authorized_keys: $1" ;;
   esac
 done
 # A key line without --domain could deploy any site on the account; that is the bug this replaces.
 [[ -n "$domain" ]] || die "this key's authorized_keys line names no --domain"
 [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$domain" != *..* ]] || die "bad --domain: $domain"
+[[ -z "$node_app" || "$node_app" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "bad --node-app: $node_app"
 
 read -r -a cmd <<< "${SSH_ORIGINAL_COMMAND:-}"
 action="${cmd[0]:-}" fqdn="${cmd[1]:-}"
@@ -49,6 +57,30 @@ SITE="$DOMAINS_DIR/$domain"
 [[ -d "$SITE" ]] || die "domain not provisioned in DirectAdmin: $domain"
 DOC="$SITE/public_html"
 PREV="$SITE/public_html.prev"
+LIVE_NAME=public_html
+if [[ -n "$node_app" ]]; then
+  # The app root moves as a whole; public_html keeps the Passenger lines cloudlinux-selector wrote.
+  [[ -d "$HOME/apps/$node_app" ]] || die "no Node.js app at ~/apps/$node_app: create it with cloudlinux-selector first"
+  grep -qs "PassengerAppRoot \"$HOME/apps/$node_app\"" "$DOC/.htaccess" \
+    || die "$domain's public_html/.htaccess does not run ~/apps/$node_app"
+  DOC="$HOME/apps/$node_app"
+  PREV="$HOME/apps/$node_app.prev"
+  LIVE_NAME="apps/$node_app"
+fi
+
+# Passenger starts the app again on its next request once tmp/restart.txt is newer than its start.
+restart(){ mkdir -p "$DOC/tmp" "$DOC/public"; touch "$DOC/tmp/restart.txt"; }
+# 200 from https://<fqdn>/healthz within 90 seconds, through Cloudflare as a visitor reaches it.
+healthy(){
+  local code=""
+  for _ in $(seq 1 18); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$domain/healthz" || true)
+    [[ "$code" == 200 ]] && return 0
+    sleep 5
+  done
+  echo "deploy-receive: https://$domain/healthz answered ${code:-nothing}, not 200" >&2
+  return 1
+}
 
 # One deploy per site at a time, whichever repository or key sent it.
 exec 9>"$SITE/.deploy.lock"
@@ -61,12 +93,16 @@ if [[ "$action" == rollback ]]; then
   trap '' HUP INT TERM PIPE
   mv "$DOC" "$SWAP"
   mv "$PREV" "$DOC" || { mv "$SWAP" "$DOC"; die "rollback failed; the live version is unchanged"; }
-  mv "$SWAP" "$PREV" || die "rolled back, but the replaced version is left at ${SWAP##*/}, not public_html.prev"
-  echo "rolled back $domain: the previous version is live, and the one it replaced is public_html.prev"
+  mv "$SWAP" "$PREV" || die "rolled back, but the replaced version is left at ${SWAP##*/}, not ${PREV##*/}"
+  if [[ -n "$node_app" ]]; then
+    restart
+    healthy || die "rolled back $domain, but the previous version is not healthy either"
+  fi
+  echo "rolled back $domain: the previous version is live, and the one it replaced is ${PREV##*/}"
   exit 0
 fi
 
-NEW="$SITE/.deploy.new.$$"
+NEW="$(dirname "$DOC")/.deploy.new.$$"
 cleanup(){ rm -rf "$NEW"; }
 trap cleanup EXIT
 
@@ -79,18 +115,23 @@ tar xzf - -C "$NEW"
 cd "$NEW"
 
 [[ -n "$(find . -type f -print -quit)" ]] || refuse "the archive holds no files" "(an empty deploy would blank the site)"
+if [[ -n "$node_app" ]]; then
+  startup=$(sed -n 's/^PassengerStartupFile //p' "$SITE/public_html/.htaccess" | tr -d '"' | head -1)
+  [[ -n "$startup" && -f "./$startup" ]] || refuse "the app's startup file is missing" "${startup:-(none in .htaccess)}"
+  [[ -f package.json ]] || refuse "a Node.js app needs its package.json" "package.json"
+fi
 
 # No process substitution in this file: the cage gives a forced command no /dev/fd.
 found=$(find . \( -type l -o \( ! -type f ! -type d \) -o \( -type f -links +1 \) \) -print)
 # A symlink would let the web server read anything the account can, other sites and ~/.ssh included.
 [[ -z "$found" ]] || refuse "links and special files are never deployed" "$found"
 
-if (( ! allow_htaccess )); then
+if [[ -z "$node_app" ]] && (( ! allow_htaccess )); then
   found=$(find . -name '.ht*' -print)
   [[ -z "$found" ]] || refuse "this key may not ship .htaccess files" "$found"
 fi
 
-if (( ! allow_code )); then
+if [[ -z "$node_app" ]] && (( ! allow_code )); then
   # Every site on the account runs as the account's user, so one script on any site can read and
   # rewrite all of them. Each extension is matched as any dot-separated part of the name, last or
   # not, since Apache's AddHandler runs x.php.jpg; matching whole parts keeps jquery.plugin.js out.
@@ -106,15 +147,15 @@ fi
 chmod -R u+rwX,go+rX,go-w .
 
 # Preserve the DA-created cgi-bin unless the site ships its own.
-if [[ -d "$DOC/cgi-bin" && ! -e "$NEW/cgi-bin" ]]; then
+if [[ -z "$node_app" && -d "$DOC/cgi-bin" && ! -e "$NEW/cgi-bin" ]]; then
   cp -a "$DOC/cgi-bin" "$NEW/cgi-bin"
 fi
 
 # --- swap, keeping one version back --------------------------------------------------------------
 # The oldest version is only deleted once the new one is in place; a failed rename puts back what was
 # live, and a dropped connection cannot stop the renames halfway.
-cd "$SITE"
-OLD="$SITE/.deploy.old.$$"
+cd "$(dirname "$DOC")"
+OLD="$(dirname "$DOC")/.deploy.old.$$"
 trap '' HUP INT TERM PIPE
 if [[ -e "$PREV" ]]; then mv "$PREV" "$OLD"; fi
 if [[ -e "$DOC" ]]; then mv "$DOC" "$PREV"; fi
@@ -126,4 +167,18 @@ fi
 trap - EXIT
 rm -rf "$OLD"
 
-echo "deployed $domain: $(find "$DOC" -type f | wc -l) files live; the previous version is public_html.prev"
+if [[ -n "$node_app" ]]; then
+  restart
+  if ! healthy; then
+    # Put the previous version back, as rollback does, so a bad release never stays up.
+    if [[ -d "$PREV" ]]; then
+      SWAP="$(dirname "$DOC")/.deploy.swap.$$"
+      mv "$DOC" "$SWAP" && mv "$PREV" "$DOC" && mv "$SWAP" "$PREV" && restart
+      # The failed version must not become the "previous" one a later rollback would bring back.
+      if healthy; then rm -rf "$PREV"; die "the new version failed its health check, so the previous one is live again (the failed one is deleted)"; fi
+      die "the new version failed its health check, and the previous one, now back, is failing too"
+    fi
+    die "the new version failed its health check and there is no previous version to go back to"
+  fi
+fi
+echo "deployed $domain: $(find "$DOC" -type f | wc -l) files live in $LIVE_NAME; the previous version is ${PREV##*/}"
