@@ -181,11 +181,15 @@ if [[ -n "$node_app" ]]; then
         restart
         die "the new version failed its health check and the previous one could not be moved back, so the new one is still live"
       fi
-      mv "$SWAP" "$PREV" || echo "deploy-receive: the failed version is left at ${SWAP##*/}, not ${PREV##*/}" >&2
       restart
-      # The failed version must not become the "previous" one a later rollback would bring back.
-      if healthy; then rm -rf "$PREV"; die "the new version failed its health check, so the previous one is live again (the failed one is deleted)"; fi
-      die "the new version failed its health check, and the previous one, now back, is failing too"
+      # The failed version stays parked until the previous one answers: then it is deleted, so a later
+      # rollback can't bring it back; if both fail, it becomes .prev so either can be looked at.
+      if healthy; then
+        rm -rf "$SWAP"
+        die "the new version failed its health check, so the previous one is live again (the failed one is deleted)"
+      fi
+      mv "$SWAP" "$PREV" || die "the new version failed its health check, the previous one, now back, is failing too, and the failed one is left at ${SWAP##*/}"
+      die "the new version failed its health check, and the previous one, now back, is failing too (the failed one is ${PREV##*/})"
     fi
     die "the new version failed its health check and there is no previous version to go back to"
   fi
