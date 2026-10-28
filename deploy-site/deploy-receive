@@ -173,7 +173,16 @@ if [[ -n "$node_app" ]]; then
     # Put the previous version back, as rollback does, so a bad release never stays up.
     if [[ -d "$PREV" ]]; then
       SWAP="$(dirname "$DOC")/.deploy.swap.$$"
-      mv "$DOC" "$SWAP" && mv "$PREV" "$DOC" && mv "$SWAP" "$PREV" && restart
+      # Each move is checked, as in rollback: a failed one puts back what it moved, so ~/apps/<name>
+      # never goes missing and the message says which version is live.
+      mv "$DOC" "$SWAP" || die "the new version failed its health check, and moving it aside failed, so it is still live"
+      if ! mv "$PREV" "$DOC"; then
+        mv "$SWAP" "$DOC" || die "the new version failed its health check and the swap back failed: it is at ${SWAP##*/}, and ~/apps/$node_app is missing"
+        restart
+        die "the new version failed its health check and the previous one could not be moved back, so the new one is still live"
+      fi
+      mv "$SWAP" "$PREV" || echo "deploy-receive: the failed version is left at ${SWAP##*/}, not ${PREV##*/}" >&2
+      restart
       # The failed version must not become the "previous" one a later rollback would bring back.
       if healthy; then rm -rf "$PREV"; die "the new version failed its health check, so the previous one is live again (the failed one is deleted)"; fi
       die "the new version failed its health check, and the previous one, now back, is failing too"
